@@ -34,13 +34,11 @@ extern crate alloc;
 
 mod page_mgmt;
 mod x86_64;
-#[doc(hidden)]
-pub use page_mgmt::LinuxUserlandReservation;
 use x86_64::{
     GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
-    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, switch_to_guest_end, switch_to_guest_start,
-    syscall_callback, tls,
+    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls,
+    set_saved_host_tls_base, set_signal_return, signal_handler_exit_guest, switch_to_guest,
+    switch_to_guest_end, switch_to_guest_start, syscall_callback, tls,
 };
 
 /// The userland Linux platform.
@@ -499,18 +497,87 @@ fn run_thread_inner(
     });
 }
 
-/// Non-guest threads (e.g., network workers, background tasks) should call this
-/// function at the start of their execution so the kernel only delivers
-/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
-/// context to re-enter the shim.
-fn block_guest_signals() {
+fn guest_signal_set() -> libc::sigset_t {
+    // SAFETY: `set` is initialized before use, and each signal number is valid.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGALRM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        let interrupt_signal = INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+        if interrupt_signal != 0 {
+            libc::sigaddset(&raw mut set, interrupt_signal);
+        }
+        set
     }
+}
+
+struct GuestSignalMaskGuard {
+    previous: libc::sigset_t,
+}
+
+impl Drop for GuestSignalMaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was populated by `pthread_sigmask` for this thread and remains valid
+        // for the lifetime of the guard.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const self.previous,
+                std::ptr::null_mut(),
+            )
+        };
+        debug_assert_eq!(result, 0, "failed to restore the thread signal mask");
+    }
+}
+
+/// Runs `f` while blocking signals reserved for delivery to guest threads.
+///
+/// Threads spawned by `f` inherit the blocked mask. The calling thread's previous mask is restored
+/// when `f` returns or unwinds.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn with_guest_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let set = guest_signal_set();
+    let mut previous = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` and `previous` are valid signal sets owned by this thread.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous) };
+    assert_eq!(result, 0, "failed to block guest signals");
+    let _guard = GuestSignalMaskGuard { previous };
+    f()
+}
+
+/// Unblocks signals reserved for delivery to guest threads on the calling thread.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn unblock_guest_signals() {
+    let set = guest_signal_set();
+    // SAFETY: `set` is a valid signal set and the null third argument means the previous mask is
+    // not requested.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
+    assert_eq!(result, 0, "failed to unblock guest signals");
+}
+
+fn spawn_guest_thread<F, T>(f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    with_guest_signals_blocked(|| {
+        std::thread::Builder::new().spawn(move || {
+            // SAFETY: the child inherits guest signals blocked. GS is set to this thread's host
+            // TLS base before unblocking them, so a signal handler cannot observe the parent's TLS.
+            unsafe { set_saved_host_tls_base() };
+            unblock_guest_signals();
+            f()
+        })
+    })
 }
 
 /// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
@@ -533,10 +600,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(move || {
-        block_guest_signals();
-        f()
-    })
+    with_guest_signals_blocked(|| std::thread::spawn(f))
 }
 
 fn thread_start(
@@ -623,8 +687,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             })
         });
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, xstate_init))?;
+        let _handle = spawn_guest_thread(move || thread_start(init_thread, ctx, xstate_init))?;
 
         Ok(())
     }
@@ -644,12 +707,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+            set_saved_host_tls_base();
         }
 
         ThreadHandle::run_with_handle(f)
