@@ -173,7 +173,8 @@ impl LvbsCrng {
 }
 
 // The PRK lives only in `crate::vault`. Never expose a raw PRK getter; use
-// `DerivedKeyProvider`.
+// `DerivedKeyProvider`. `derive_key` uses the PRK; `compute_with_derived_key`
+// supports only the per-boot key (`RootKey::PerBoot`) derived from it.
 
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     fn derive_key<E>(
@@ -181,57 +182,105 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
         kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
-        use litebox::platform::{DerivedKeyError, KDFParams};
+        use crate::vault::{Input, Kdf};
+        use litebox::platform::DerivedKeyError;
 
-        struct Ctx<'a, E> {
-            kdf: fn(&[u8], KDFParams) -> Result<(), E>,
-            params: Option<KDFParams<'a>>,
-            result: Option<Result<(), E>>,
-        }
-
-        if !crate::vault::is_installed() {
-            return Err(DerivedKeyError::UnsupportedRebootPersistentKey);
-        }
         let Some(kdf) = kdf else {
             return Err(DerivedKeyError::ShimKDFRequired);
         };
-
-        // Bounce buffers the vault cannot reach through kernel heap memory.
-        let KDFParams { context, output } = params;
-        let context_copy;
-        let context = if crate::vault::is_accessible(context) {
-            context
-        } else {
-            context_copy = Zeroizing::new(context.to_vec());
-            context_copy.as_slice()
+        let stage = Kdf {
+            f: kdf,
+            context: Input::new(params.context),
         };
-        let mut output_copy = (!crate::vault::is_accessible(output))
-            .then(|| Zeroizing::new(::alloc::vec![0u8; output.len()]));
-
-        let mut ctx = Ctx {
-            kdf,
-            params: Some(KDFParams {
-                context,
-                output: match output_copy.as_mut() {
-                    Some(copy) => copy.as_mut_slice(),
-                    None => &mut *output,
-                },
-            }),
-            result: None,
-        };
-        crate::vault::with_prk(&mut ctx, |prk, ctx| {
-            if let Some(params) = ctx.params.take() {
-                // Safety: this callback runs inside the serialized vault window.
-                ctx.result = Some(unsafe { crate::vault::invoke_kdf(ctx.kdf, prk, params) });
-            }
-        })
-        .map_err(|_| DerivedKeyError::UnsupportedRebootPersistentKey)?;
-        ctx.result.expect("vault did not run the KDF")?;
-        if let Some(copy) = &output_copy {
-            output.copy_from_slice(copy);
-        }
+        crate::vault::run(&stage, params.output).map_err(|_| DerivedKeyError::KeyUnavailable)??;
         Ok(())
     }
+
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        root: litebox::platform::RootKey,
+        kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], litebox::platform::ComputeParams) -> Result<(), E>,
+        params: litebox::platform::ComputeParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
+        use crate::vault::{Compute, Input, Kdf, Then};
+        use litebox::platform::{DerivedKeyError, RootKey};
+
+        if root != RootKey::PerBoot {
+            return Err(DerivedKeyError::UnsupportedRebootPersistentKey);
+        }
+
+        // The vault derives the per-boot key from the PRK first; `kdf` is passed
+        // only the per-boot key, and `op` only the derived key. Both stay on the
+        // vault stack.
+        let kdf_op = Then::<_, _, KEY_LEN>(
+            Kdf {
+                f: kdf,
+                context: Input::new(key_context),
+            },
+            Compute {
+                f: op,
+                input: Input::new(params.input),
+            },
+        );
+        let stage = Then::<_, _, PBK_LEN>(
+            PerBootKey {
+                nonce: per_boot_nonce(self),
+            },
+            kdf_op,
+        );
+        crate::vault::run(&stage, params.output).map_err(|_| DerivedKeyError::KeyUnavailable)??;
+        Ok(())
+    }
+}
+
+const PBK_LEN: usize = 32;
+const PER_BOOT_NONCE_LEN: usize = 32;
+
+/// Random per-boot nonce from which, with the PRK, the per-boot key is derived.
+/// It is not secret: it reveals nothing without the PRK.
+fn per_boot_nonce(platform: &LvbsLinuxKernel) -> &'static [u8; PER_BOOT_NONCE_LEN] {
+    use litebox::platform::CrngProvider as _;
+
+    static PER_BOOT_NONCE: spin::Once<[u8; PER_BOOT_NONCE_LEN]> = spin::Once::new();
+    PER_BOOT_NONCE.call_once(|| {
+        let mut nonce = [0u8; PER_BOOT_NONCE_LEN];
+        platform.fill_bytes_crng(&mut nonce);
+        nonce
+    })
+}
+
+/// Vault stage deriving the per-boot key (PBK) from the PRK and the per-boot
+/// nonce: PBK = SHA-256(label || PRK || nonce). Being platform code, it is
+/// called directly rather than through a retpoline.
+struct PerBootKey {
+    /// In the kernel image, which the vault maps.
+    nonce: &'static [u8; PER_BOOT_NONCE_LEN],
+}
+
+impl<E> crate::vault::Stage<E> for PerBootKey {
+    unsafe fn run(&self, prk: &[u8], output: &mut [u8]) -> Result<(), E> {
+        // `Then::<_, _, PBK_LEN>` sizes `output`, so this cannot panic (which
+        // may be fatal inside the vault).
+        debug_assert_eq!(output.len(), PBK_LEN);
+        output.copy_from_slice(&per_boot_key_from_prk_and_nonce(prk, self.nonce)[..]);
+        Ok(())
+    }
+}
+
+fn per_boot_key_from_prk_and_nonce(
+    prk: &[u8],
+    nonce: &[u8; PER_BOOT_NONCE_LEN],
+) -> Zeroizing<[u8; PBK_LEN]> {
+    Zeroizing::new(
+        sha2::Sha256::new()
+            .chain_update(b"litebox-lvbs-pbk-v1")
+            .chain_update(prk)
+            .chain_update(nonce)
+            .finalize()
+            .into(),
+    )
 }
 
 /// Derive the initial CRNG seed inside the vault.
