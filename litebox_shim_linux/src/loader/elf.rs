@@ -4,16 +4,17 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     fs::{Mode, OFlags},
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{
-    MapFlags,
+    MapFlags, PAGE_SIZE,
     errno::Errno,
     loader::ElfParsedFile,
-    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
+    vmem::{CreatePagesFlags, MappingError},
 };
 use thiserror::Error;
 
@@ -305,9 +306,8 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length =
-                litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                    .expect("DEFAULT_STACK_SIZE is not page-aligned");
+            let length = litebox::mm::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+                .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .mm
                 .create_stack_pages(None, length, CreatePagesFlags::TOP_DOWN)

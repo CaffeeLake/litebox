@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use core::ops::Deref;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     LiteBox,
     net::Network,
@@ -29,14 +30,14 @@ use litebox::{
     shim::ContinueOperation,
     sync::Mutex,
     sync::futex::FutexManager,
+    user_pointers::{UserPtr, UserPtrMut},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{
-    SyscallRequest,
+    PAGE_SIZE, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
-    user_pointers::{UserPtr, UserPtrMut},
-    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
+    vmem::{CreatePagesFlags, MappingError},
 };
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.

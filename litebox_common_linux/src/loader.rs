@@ -8,6 +8,7 @@
 //!   new process, including both static and dynamic ELF binaries.
 //! * Loading LiteBox trampoline code for syscall handling.
 
+use crate::PAGE_SIZE;
 use alloc::vec::Vec;
 use elf::file::FileHeader;
 use litebox::{
@@ -17,7 +18,7 @@ use litebox::{
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::{errno::Errno, vmem::PAGE_SIZE};
+use crate::errno::Errno;
 
 type Endian = elf::endian::LittleEndian;
 

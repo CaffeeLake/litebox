@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod arch;
 pub mod event;
 pub mod fd;
 pub mod fs;
@@ -26,6 +27,7 @@ pub mod platform;
 pub mod shim;
 pub mod sync;
 pub mod tls;
+pub mod user_pointers;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.

@@ -19,6 +19,7 @@ use std::time::Duration;
 use std::unimplemented;
 
 use litebox::fs::OFlags;
+use litebox::mm::vmap::VmapManager;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
@@ -26,7 +27,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1752,21 +1753,21 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
 unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
-    type MapInfo = litebox_common_linux::vmap::NoopPhysPageMapInfo;
+    type MapInfo = litebox::mm::vmap::NoopPhysPageMapInfo;
 
     fn validate_unowned(
         &self,
-        _pages: &litebox_common_linux::vmap::PhysPageAddrArray<ALIGN>,
-    ) -> Result<(), litebox_common_linux::vmap::PhysPointerError> {
-        Err(litebox_common_linux::vmap::PhysPointerError::UnsupportedOperation)
+        _pages: &litebox::mm::vmap::PhysPageAddrArray<ALIGN>,
+    ) -> Result<(), litebox::mm::vmap::PhysPointerError> {
+        Err(litebox::mm::vmap::PhysPointerError::UnsupportedOperation)
     }
 
     unsafe fn protect(
         &self,
-        _pages: &litebox_common_linux::vmap::PhysPageAddrArray<ALIGN>,
-        _perms: litebox_common_linux::vmap::PhysPageMapPermissions,
-    ) -> Result<(), litebox_common_linux::vmap::PhysPointerError> {
-        Err(litebox_common_linux::vmap::PhysPointerError::UnsupportedOperation)
+        _pages: &litebox::mm::vmap::PhysPageAddrArray<ALIGN>,
+        _perms: litebox::mm::vmap::PhysPageMapPermissions,
+    ) -> Result<(), litebox::mm::vmap::PhysPointerError> {
+        Err(litebox::mm::vmap::PhysPointerError::UnsupportedOperation)
     }
 }
 
