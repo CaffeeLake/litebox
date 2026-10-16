@@ -678,10 +678,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
-            return Err(Errno::ECONNREFUSED);
-        }
         let mut check_progress = false;
+        let mut already_in_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
@@ -696,10 +694,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     check_progress = true;
                     Err(TryOpError::TryAgain)
                 }
+                // A blocking call waits for an earlier attempt just as for its own.
+                Err(litebox::net::errors::ConnectError::AlreadyInProgress) => {
+                    check_progress = true;
+                    already_in_progress = true;
+                    Err(TryOpError::TryAgain)
+                }
                 Err(e) => Err(TryOpError::Other(e.into())),
             },
         )
         .map_err(|err| match err {
+            TryOpError::TryAgain if already_in_progress => Errno::EALREADY,
             TryOpError::TryAgain => Errno::EINPROGRESS,
             err => err.into(),
         })
@@ -866,7 +871,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         Some(err) => Err(TryOpError::Other(err.into())),
                         None => Ok(0),
                     },
-                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                    // A pending error, such as the reset of an aborted connection attempt, is
+                    // reported first.
+                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(
+                        proxy
+                            .get_async_error(true)
+                            .map_or(Errno::ENOTCONN, Errno::from),
+                    )),
                 },
             )
             .map_err(Errno::from)
@@ -2158,6 +2169,26 @@ mod tests {
         optval
     }
 
+    /// Helper to wait until a socket is ready for input or output, or the peer has closed, and
+    /// return its poll events.
+    fn poll_events(task: &TestTask, raw_fd: u32) -> litebox::event::Events {
+        use litebox::event::Events;
+        let mut pollfd = [litebox_common_linux::Pollfd {
+            fd: i32::try_from(raw_fd).unwrap(),
+            events: i16::try_from((Events::IN | Events::OUT | Events::RDHUP).bits()).unwrap(),
+            revents: 0,
+        }];
+        task.sys_ppoll(
+            UserPtrMut::from_usize(pollfd.as_mut_ptr() as usize),
+            1,
+            litebox_common_linux::TimeParam::None,
+            None,
+            0,
+        )
+        .unwrap();
+        Events::from_bits(u32::from(pollfd[0].revents.cast_unsigned())).unwrap()
+    }
+
     fn epoll_add(task: &TestTask, epfd: i32, target_fd: u32, events: litebox::event::Events) {
         let ev = litebox_common_linux::EpollEvent {
             events: events.bits(),
@@ -2462,11 +2493,150 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, litebox_common_linux::errno::Errno::ECONNREFUSED);
 
-        let so_err = get_so_error(&task, &socket_fd2);
-        assert_eq!(so_err, i32::from(Errno::ECONNREFUSED).cast_unsigned());
-
-        // Second read should be cleared (self-clearing semantics)
+        // `connect` already reported the error, so it is no longer pending.
         assert_eq!(get_so_error(&task, &socket_fd2), 0);
+    }
+
+    #[test]
+    fn test_tun_tcp_connect_states() {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let address = |ip: [u8; 4], port: u16| {
+            SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                core::net::Ipv4Addr::from(ip),
+                port,
+            )))
+        };
+        let listener = std::net::TcpListener::bind("10.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+
+        // Nothing answers 10.0.0.3, so the attempt stays in progress.
+        let raw_pending_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let pending_fd = typed_socket(&task, raw_pending_fd);
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 3], port)),
+            Err(Errno::EINPROGRESS)
+        );
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 1], port)),
+            Err(Errno::EALREADY)
+        );
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 1], 0)),
+            Err(Errno::EALREADY)
+        );
+        close_socket(&task, raw_pending_fd);
+
+        // A blocking call waits for the outcome of an earlier attempt, here one that another
+        // thread aborts by shutting the socket down.
+        let raw_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 3], port)),
+            Err(Errno::EINPROGRESS)
+        );
+        task.sys_fcntl(
+            i32::try_from(raw_fd).unwrap(),
+            litebox_common_linux::FcntlArg::SETFL(litebox::fs::OFlags::empty()),
+        )
+        .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let blocked = task.spawn_clone_for_test(move |task| {
+            let fd = typed_socket(&task, raw_fd);
+            started_tx.send(()).unwrap();
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT))
+        });
+        // Give the call time to start waiting before the attempt is aborted.
+        started_rx.recv().unwrap();
+        std::thread::sleep(core::time::Duration::from_millis(100));
+        assert!(!blocked.is_finished());
+        task.sys_shutdown(
+            i32::try_from(raw_fd).unwrap(),
+            litebox_common_linux::SHUT_RDWR,
+        )
+        .unwrap();
+        assert_eq!(blocked.join().unwrap(), Err(Errno::ECONNRESET));
+        assert_eq!(get_so_error(&task, &fd), 0);
+        close_socket(&task, raw_fd);
+
+        // A failed attempt can neither receive nor send, and once `SO_ERROR` has reported its
+        // error, `connect` reports only the abort and leaves the socket unconnected.
+        let closed = {
+            use litebox::event::Events;
+            Events::IN | Events::OUT | Events::HUP | Events::RDHUP
+        };
+        let raw_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        assert_eq!(
+            poll_events(&task, raw_fd),
+            closed | litebox::event::Events::ERR
+        );
+        assert_eq!(
+            i32::try_from(get_so_error(&task, &fd)).unwrap(),
+            i32::from(Errno::ECONNREFUSED)
+        );
+        assert_eq!(poll_events(&task, raw_fd), closed);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::ECONNABORTED)
+        );
+        assert_eq!(get_so_error(&task, &fd), 0);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        close_socket(&task, raw_fd);
+
+        // A refused attempt leaves the socket unconnected, so it can connect again.
+        let raw_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], 0)),
+            Err(Errno::ECONNREFUSED)
+        );
+        assert_eq!(get_so_error(&task, &fd), 0);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::ECONNREFUSED)
+        );
+        task.do_connect(&fd, address([10, 0, 0, 1], port)).unwrap();
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], port)),
+            Err(Errno::EISCONN)
+        );
+        assert_eq!(
+            task.do_connect(&fd, address([0, 0, 0, 0], port)),
+            Err(Errno::EISCONN)
+        );
+        server.join().unwrap();
+        close_socket(&task, raw_fd);
     }
 
     #[test]
@@ -2919,8 +3089,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, Errno::ETIMEDOUT);
 
-        let so_err = get_so_error(&task, &sockfd);
-        assert_eq!(so_err, i32::from(Errno::ETIMEDOUT).cast_unsigned());
+        // `connect` already reported the error, so it is no longer pending.
+        assert_eq!(get_so_error(&task, &sockfd), 0);
 
         close_socket(&task, raw_sockfd);
     }
@@ -2971,7 +3141,54 @@ mod tests {
             close_socket(&task, raw_fd);
         }
 
-        // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening.
+        // Like Linux, an unconnected TCP socket is shut down even though `ENOTCONN` is reported,
+        // so receives see end-of-file once the read side is shut down.
+        for (how, expected) in [(SHUT_WR, Err(Errno::ENOTCONN)), (SHUT_RD, Ok(0))] {
+            let raw_tcp = task
+                .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+                .unwrap();
+            let tcp = typed_socket(&task, raw_tcp);
+            assert_eq!(
+                task.sys_shutdown(i32::try_from(raw_tcp).unwrap(), how),
+                Err(Errno::ENOTCONN)
+            );
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+                expected
+            );
+            close_socket(&task, raw_tcp);
+        }
+
+        // Like Linux, shutting down a connecting TCP socket reports a reset and leaves the socket
+        // unconnected.
+        let raw_tcp = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let tcp = typed_socket(&task, raw_tcp);
+        assert_eq!(
+            task.do_connect(&tcp, inet_addr([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        shutdown(&task, raw_tcp, SHUT_RDWR);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ECONNRESET)
+        );
+        assert_eq!(
+            task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ENOTCONN)
+        );
+        close_socket(&task, raw_tcp);
+
+        // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening and leaves
+        // the socket unconnected.
         let raw_listener = task
             .do_socket(
                 AddressFamily::INET,
@@ -2990,6 +3207,14 @@ mod tests {
         assert_eq!(accept(), Err(Errno::EAGAIN));
         shutdown(&task, raw_listener, SHUT_RD);
         assert_eq!(accept(), Err(Errno::EINVAL));
+        assert_eq!(
+            poll_events(&task, raw_listener),
+            litebox::event::Events::HUP | litebox::event::Events::OUT
+        );
+        assert_eq!(
+            task.do_recvfrom(&listener, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ENOTCONN)
+        );
         assert_eq!(
             task.sys_shutdown(listener_fd, SHUT_RD),
             Err(Errno::ENOTCONN)

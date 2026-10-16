@@ -125,9 +125,17 @@ fn pump(network: &mut Network<MockPlatform>) {
 }
 
 fn stream_socket(network: &mut Network<MockPlatform>) -> (SocketFd<MockPlatform>, TestProxy) {
+    stream_socket_with_rx_capacity(network, SOCKET_BUFFER_SIZE)
+}
+
+/// Like [`stream_socket`], with the given receive channel capacity.
+fn stream_socket_with_rx_capacity(
+    network: &mut Network<MockPlatform>,
+    rx_capacity: usize,
+) -> (SocketFd<MockPlatform>, TestProxy) {
     let fd = network.socket(Protocol::Tcp).unwrap();
     let proxy = alloc::sync::Arc::new(NetworkProxy::Stream(
-        socket_channel::StreamSocketChannel::new(),
+        socket_channel::StreamSocketChannel::new_with_capacity(rx_capacity, SOCKET_BUFFER_SIZE),
     ));
     assert!(network.set_socket_proxy(&fd, proxy.clone()));
     (fd, proxy)
@@ -149,26 +157,30 @@ fn connect_and_accept(
     (SocketFd<MockPlatform>, TestProxy),
     (SocketFd<MockPlatform>, TestProxy),
 ) {
-    connect_and_accept_with_server_rx_capacity(network, listener, SOCKET_BUFFER_SIZE)
+    connect_and_accept_with_rx_capacities(network, listener, SOCKET_BUFFER_SIZE, SOCKET_BUFFER_SIZE)
 }
 
-/// Like [`connect_and_accept`], with the given receive channel capacity for the server end.
-fn connect_and_accept_with_server_rx_capacity(
+/// Like [`connect_and_accept`], with the given receive channel capacities for the two ends.
+fn connect_and_accept_with_rx_capacities(
     network: &mut Network<MockPlatform>,
     listener: &SocketFd<MockPlatform>,
-    rx_capacity: usize,
+    client_rx_capacity: usize,
+    server_rx_capacity: usize,
 ) -> (
     (SocketFd<MockPlatform>, TestProxy),
     (SocketFd<MockPlatform>, TestProxy),
 ) {
-    let (client_fd, client) = stream_socket(network);
+    let (client_fd, client) = stream_socket_with_rx_capacity(network, client_rx_capacity);
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InProgress));
     pump(network);
     let server_fd = network.accept(listener, None).unwrap();
     let server = alloc::sync::Arc::new(NetworkProxy::Stream(
-        socket_channel::StreamSocketChannel::new_with_capacity(rx_capacity, SOCKET_BUFFER_SIZE),
+        socket_channel::StreamSocketChannel::new_with_capacity(
+            server_rx_capacity,
+            SOCKET_BUFFER_SIZE,
+        ),
     ));
     assert!(network.set_socket_proxy(&server_fd, server.clone()));
     pump(network);
@@ -290,7 +302,7 @@ fn test_tcp_reset_reported_before_unread_data() {
     let listener = listening_socket(&mut network);
     // A small channel leaves the data that does not fit in smoltcp.
     let ((client_fd, client), (server_fd, server)) =
-        connect_and_accept_with_server_rx_capacity(&mut network, &listener, 4);
+        connect_and_accept_with_rx_capacities(&mut network, &listener, SOCKET_BUFFER_SIZE, 4);
 
     assert_eq!(write(&client, b"hello world").unwrap(), 11);
     pump(&mut network);
@@ -335,7 +347,7 @@ fn test_tcp_graceful_close_with_unread_data() {
     network.set_platform_interaction(PlatformInteraction::Manual);
     let listener = listening_socket(&mut network);
     let ((client_fd, client), (server_fd, server)) =
-        connect_and_accept_with_server_rx_capacity(&mut network, &listener, 4);
+        connect_and_accept_with_rx_capacities(&mut network, &listener, SOCKET_BUFFER_SIZE, 4);
 
     // The connection closes gracefully while smoltcp still holds data that did not fit in the
     // channel: the peer's FIN, then ours.
@@ -456,12 +468,15 @@ fn test_tcp_shutdown_while_connecting() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     let (client_fd, client) = stream_socket(&mut network);
+    // A socket that has not connected stays unconnected.
+    pump(&mut network);
+    assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InProgress));
 
     // Shutting down aborts the connection attempt, which is reported as a reset rather than a
-    // refused connection.
+    // refused connection, and leaves the socket unconnected.
     network.shutdown(&client_fd, Shutdown::Both).unwrap();
     pump(&mut network);
     assert!(
@@ -473,6 +488,238 @@ fn test_tcp_shutdown_while_connecting() {
         client.get_async_error(true),
         Some(errors::SocketAsyncError::ConnectionReset)
     ));
+    pump(&mut network);
+    assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
+    assert!(!client.check_io_events().contains(Events::ERR));
+
+    // Another attempt can then connect, discarding the error of an aborted attempt.
+    let listener = listening_socket(&mut network);
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    network.shutdown(&client_fd, Shutdown::Both).unwrap();
+    assert!(client.get_async_error(false).is_some());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    assert!(client.get_async_error(false).is_none());
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
 
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_connect_reports_connection_state() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+
+    // Another call while the attempt is in progress does not start a new one.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyInProgress));
+
+    // The first call after the attempt succeeds reports the success; later calls report that the
+    // socket is already connected.
+    pump(&mut network);
+    network.connect(&client_fd, &addr, false).unwrap();
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+
+    // So do accepted and listening sockets.
+    let server_fd = network.accept(&listener, None).unwrap();
+    let err = network.connect(&server_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+    let err = network.connect(&listener, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+
+    // A connected socket stays connected after the connection is lost.
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    pump(&mut network);
+    assert!(matches!(
+        client.get_async_error(false),
+        Some(errors::SocketAsyncError::ConnectionReset)
+    ));
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_reconnect_after_refused_connect() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let assert_unconnected = || {
+        assert!(client.get_async_error(false).is_none());
+        assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
+        let events = client.check_io_events();
+        assert!(events.contains(Events::OUT | Events::HUP));
+        assert!(!events.contains(Events::ERR));
+    };
+
+    // A refusal reported while checking progress leaves the socket unconnected, with the error no
+    // longer pending.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    let local_addr = network.get_local_addr(&client_fd).unwrap();
+    pump(&mut network);
+    let err = network.connect(&client_fd, &addr, true).unwrap_err();
+    assert!(matches!(err, ConnectError::InvalidState));
+    assert_unconnected();
+
+    // So does a refusal reported by the next call, after it is pending. Until then, the socket can
+    // neither receive nor send.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    assert_eq!(
+        client.check_io_events(),
+        Events::IN | Events::OUT | Events::HUP | Events::RDHUP | Events::ERR
+    );
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InvalidState));
+    assert_unconnected();
+
+    // Another attempt then connects from the same local port.
+    let listener = listening_socket(&mut network);
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    assert_eq!(network.get_local_addr(&client_fd).unwrap(), local_addr);
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_reconnect_after_lost_connection() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let assert_unconnected = |client: &TestProxy| {
+        assert!(client.get_async_error(false).is_none());
+        assert!(matches!(read(client), Err(ChannelReadError::NotConnected)));
+        let events = client.check_io_events();
+        assert!(events.contains(Events::OUT | Events::HUP));
+        assert!(!events.intersects(Events::IN | Events::RDHUP | Events::ERR));
+    };
+
+    // The loss of a connection that `connect` has not reported yet is reported by the next call,
+    // which discards what is left of the connection, including data that smoltcp holds because
+    // the channel is full.
+    let ((client_fd, client), (server_fd, server)) =
+        connect_and_accept_with_rx_capacities(&mut network, &listener, 2, SOCKET_BUFFER_SIZE);
+    write(&server, b"old").unwrap();
+    pump(&mut network);
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    pump(&mut network);
+    assert!(
+        client
+            .check_io_events()
+            .contains(Events::IN | Events::RDHUP | Events::ERR)
+    );
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::ConnectionReset));
+    pump(&mut network);
+    assert_unconnected(&client);
+    let mut buf = [0; 3];
+    let err = network
+        .receive(&client_fd, &mut buf, ReceiveFlags::empty(), None)
+        .unwrap_err();
+    assert!(matches!(err, ReceiveError::SocketInInvalidState));
+
+    // Another attempt then starts afresh.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
+    pump(&mut network);
+    let events = client.check_io_events();
+    assert!(events.contains(Events::OUT));
+    assert!(!events.intersects(Events::IN | Events::RDHUP | Events::ERR | Events::HUP));
+    assert_eq!(write(&client, b"new").unwrap(), 3);
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+
+    // The loss is reported even if the network worker has not recorded it yet.
+    let ((client_fd, client), (server_fd, _)) = connect_and_accept(&mut network, &listener);
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    while tcp_state(&network, &client_fd) != tcp::State::Closed {
+        network.perform_platform_interaction();
+    }
+    assert!(!client.check_io_events().contains(Events::ERR));
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::ConnectionReset));
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+
+    // A lost connection can neither receive nor send, and once another operation has reported
+    // the loss, only an abort is left to report.
+    let closed = Events::IN | Events::OUT | Events::HUP | Events::RDHUP;
+    let ((client_fd, client), (server_fd, _)) = connect_and_accept(&mut network, &listener);
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    pump(&mut network);
+    assert_eq!(client.check_io_events(), closed | Events::ERR);
+    assert!(matches!(
+        client.get_async_error(true),
+        Some(errors::SocketAsyncError::ConnectionReset)
+    ));
+    assert_eq!(client.check_io_events(), closed);
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::ConnectionAborted));
+    assert_unconnected(&client);
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+
+    // The same holds after the peer's FIN, which smoltcp remembers after the reset.
+    let ((client_fd, client), (server_fd, _)) = connect_and_accept(&mut network, &listener);
+    network.shutdown(&server_fd, Shutdown::Write).unwrap();
+    pump(&mut network);
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    pump(&mut network);
+    assert!(client.check_io_events().contains(Events::RDHUP));
+    network.connect(&client_fd, &addr, false).unwrap_err();
+    pump(&mut network);
+    assert_unconnected(&client);
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_connect_from_bound_port() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, _client) = stream_socket(&mut network);
+    let local_addr = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:5555").unwrap());
+    network.bind(&client_fd, &local_addr).unwrap();
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let mut peer = local_addr;
+    let server_fd = network.accept(&listener, Some(&mut peer)).unwrap();
+    assert_eq!(peer.port(), 5555);
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
 }

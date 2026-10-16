@@ -232,8 +232,26 @@ pub(crate) struct TcpSpecific {
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
-    /// Timestamp when `connect` was initiated
-    connect_initiated_at_us: Option<smoltcp::time::Instant>,
+    /// The connection status, as reported to the user of the socket
+    connection_status: ConnectionStatus,
+}
+
+/// The connection status of a TCP socket, as reported to its user.
+///
+/// This is not the TCP state of the connection: it changes only when an operation reports a
+/// change, so it can lag behind the TCP state, and it does not follow the connection as it closes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionStatus {
+    /// Never connected, or the failure of the last attempt has been reported, so a connection
+    /// attempt can be started
+    Unconnected,
+    /// A connection attempt, started at `initiated_at`, whose outcome is not yet reported
+    Connecting {
+        initiated_at: smoltcp::time::Instant,
+    },
+    /// Connected, as reported by `connect` or by `accept`. This stays even after the connection
+    /// closes, since the socket cannot connect again.
+    Connected,
 }
 
 /// Socket-specific data for TCP server sockets
@@ -611,8 +629,13 @@ where
                     tcp_socket.close();
                 }
 
+                // An unconnected socket has no connection to receive from or report on, even if
+                // smoltcp still holds data or the FIN of a failed one.
+                let tcp_specific = socket_handle.specific.tcp();
+                let connected = tcp_specific.connection_status != ConnectionStatus::Unconnected;
+
                 // Drain RX buffer: from smoltcp directly to ring buffer
-                while tcp_socket.can_recv() {
+                while connected && tcp_socket.can_recv() {
                     let received = proxy
                         .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
                     if received == 0 {
@@ -621,23 +644,24 @@ where
                 }
                 // smoltcp reports `Finished` only once the peer's FIN has been received and all
                 // data before it has been moved to the channel.
-                let fin_received = matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
+                let fin_received =
+                    connected && matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
                 if fin_received {
                     proxy.shutdown_read();
                 }
 
-                let tcp_specific = socket_handle.specific.tcp();
                 // Record the peer's FIN as soon as it is seen, so that poll reports it at once.
                 // This also tells a reset from a graceful close below, since smoltcp does not say
                 // whether a closed connection received the FIN.
                 if fin_received
-                    || matches!(
-                        tcp_socket.state(),
-                        tcp::State::CloseWait
-                            | tcp::State::LastAck
-                            | tcp::State::Closing
-                            | tcp::State::TimeWait
-                    )
+                    || connected
+                        && matches!(
+                            tcp_socket.state(),
+                            tcp::State::CloseWait
+                                | tcp::State::LastAck
+                                | tcp::State::Closing
+                                | tcp::State::TimeWait
+                        )
                 {
                     proxy.set_peer_closed();
                 }
@@ -649,8 +673,10 @@ where
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
                             // Socket closed while connecting. Distinguish RST from timeout.
-                            let error = match tcp_specific.connect_initiated_at_us {
-                                Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
+                            let error = match tcp_specific.connection_status {
+                                ConnectionStatus::Connecting { initiated_at }
+                                    if now - initiated_at >= TCP_CONNECT_TIMEOUT =>
+                                {
                                     errors::SocketAsyncError::TimedOut
                                 }
                                 _ => errors::SocketAsyncError::ConnectionRefused,
@@ -677,6 +703,8 @@ where
                             }
                             proxy.set_peer_closed();
                         }
+                        // A socket that has not connected stays unconnected.
+                        socket_channel::SocketState::Initial => {}
                         _ => {
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
@@ -833,7 +861,7 @@ where
                     local_port: None,
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
-                    connect_initiated_at_us: None,
+                    connection_status: ConnectionStatus::Unconnected,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
@@ -1007,8 +1035,17 @@ where
 
     /// Initiate a connection to an IP address
     ///
-    /// When `check_progress` is false, this function attempts to initiate a connection.
-    /// Otherwise, this function checks the progress of an ongoing connection.
+    /// When `check_progress` is false, this function starts a connection attempt on an unconnected
+    /// socket, reusing its local port if it has one, and otherwise reports the state of the
+    /// socket: [`ConnectError::AlreadyInProgress`] while an earlier attempt is in progress, and
+    /// [`ConnectError::AlreadyConnected`] once connected or listening. When `check_progress` is
+    /// true, this function checks the progress of an ongoing connection.
+    ///
+    /// The outcome of a TCP connection attempt is reported once, by the first call to observe it.
+    /// This includes the loss of a connection that no call has yet reported as established. A
+    /// reported failure discards what is left of the connection and leaves the socket unconnected,
+    /// so that another attempt can be started. A failure whose error another operation has already
+    /// reported is reported as [`ConnectError::ConnectionAborted`].
     pub fn connect(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1027,8 +1064,17 @@ where
         let now = self.now();
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
-                let check_state = |state: tcp::State| -> Result<(), ConnectError> {
-                    match state {
+                // Record what the latest packets did to the connection, as the next pass of the
+                // network worker would, so that the outcome reported below is up to date.
+                Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
+                let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let tcp_specific = socket_handle.specific.tcp_mut();
+                let connecting = matches!(
+                    tcp_specific.connection_status,
+                    ConnectionStatus::Connecting { .. }
+                );
+                if check_progress || connecting {
+                    let mut result = match socket.state() {
                         tcp::State::Established
                         | tcp::State::CloseWait
                         | tcp::State::FinWait1
@@ -1038,43 +1084,91 @@ where
                             // already connected (either side may have since shut down writes)
                             Ok(())
                         }
-                        tcp::State::Closed | tcp::State::TimeWait => {
+                        tcp::State::SynSent | tcp::State::SynReceived if check_progress => {
+                            Err(ConnectError::InProgress)
+                        }
+                        tcp::State::SynSent | tcp::State::SynReceived => {
+                            Err(ConnectError::AlreadyInProgress)
+                        }
+                        tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {
                             Err(ConnectError::InvalidState)
                         }
-                        tcp::State::SynSent => Err(ConnectError::InProgress),
-                        s => unimplemented!("state: {:?}", s),
+                    };
+                    match result {
+                        Ok(()) => tcp_specific.connection_status = ConnectionStatus::Connected,
+                        Err(ConnectError::InvalidState) => {
+                            // Report the failure recorded for the attempt, if any. A failure that
+                            // another operation has already reported leaves only an abort.
+                            let recorded = socket_handle
+                                .proxy
+                                .as_ref()
+                                .map(|proxy| proxy.get_async_error(false));
+                            result = match recorded {
+                                Some(Some(errors::SocketAsyncError::ConnectionReset)) => {
+                                    Err(ConnectError::ConnectionReset)
+                                }
+                                Some(Some(errors::SocketAsyncError::TimedOut)) => {
+                                    Err(ConnectError::TimedOut)
+                                }
+                                Some(None) => Err(ConnectError::ConnectionAborted),
+                                _ => Err(ConnectError::InvalidState),
+                            };
+                            // Reporting the failure leaves the socket unconnected.
+                            tcp_specific.connection_status = ConnectionStatus::Unconnected;
+                        }
+                        _ => {}
                     }
-                };
-
-                let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                if check_progress {
-                    check_state(socket.state())
+                    result
+                } else if tcp_specific.connection_status == ConnectionStatus::Connected
+                    || tcp_specific
+                        .server_socket
+                        .as_ref()
+                        .is_some_and(|server_socket| server_socket.backlog.is_some())
+                {
+                    Err(ConnectError::AlreadyConnected)
                 } else {
-                    let local_port = self.local_port_allocator.ephemeral_port()?;
-                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
+                    // Reuse the local port from `bind` or from an earlier attempt, if any.
+                    let (local_port, ephemeral) = match tcp_specific.local_port.take() {
+                        Some(local_port) => (local_port, false),
+                        None => (self.local_port_allocator.ephemeral_port()?, true),
+                    };
+                    let local_endpoint = smoltcp::wire::IpListenEndpoint {
+                        addr: tcp_specific
+                            .server_socket
+                            .as_ref()
+                            .and_then(|server_socket| server_socket.ip_listen_endpoint.addr)
+                            .filter(|addr| !addr.is_unspecified()),
+                        port: local_port.port(),
+                    };
                     let addr: smoltcp::wire::IpEndpoint = (*addr).into();
                     match socket.connect(self.interface.context(), addr, local_endpoint) {
                         Ok(()) => {
                             socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
-                            let tcp_specific = socket_handle.tcp_mut();
-                            tcp_specific.connect_initiated_at_us = Some(now);
-                            let old_port = tcp_specific.local_port.replace(local_port);
-                            if old_port.is_some() {
-                                // Need to think about how to handle this situation
-                                unimplemented!()
+                            tcp_specific.local_port = Some(local_port);
+                            tcp_specific.server_socket = None;
+                            tcp_specific.connection_status =
+                                ConnectionStatus::Connecting { initiated_at: now };
+                            // The new attempt has no error yet.
+                            if let Some(proxy) = &socket_handle.proxy {
+                                let _ = proxy.get_async_error(true);
                             }
-                            check_state(socket.state())
+                            Err(ConnectError::InProgress)
                         }
+                        // An unconnected socket is always closed.
                         Err(tcp::ConnectError::InvalidState) => unreachable!(),
                         Err(tcp::ConnectError::Unaddressable) => {
-                            self.local_port_allocator.deallocate(local_port);
+                            if ephemeral {
+                                self.local_port_allocator.deallocate(local_port);
+                            } else {
+                                tcp_specific.local_port = Some(local_port);
+                            }
                             Err(ConnectError::Unaddressable)
                         }
                     }
                 }
             }
             Protocol::Udp => {
-                if addr.port() == 0 {
+                if addr.port() == 0 || addr.ip().is_unspecified() {
                     return Err(ConnectError::Unaddressable);
                 }
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -1093,25 +1187,22 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
-        let mut result = ret;
         if let Some(proxy) = &socket_handle.proxy {
             match ret {
                 Ok(()) => proxy.set_state(socket_channel::SocketState::Connected),
                 Err(ConnectError::InProgress) => {
                     proxy.set_state(socket_channel::SocketState::Connecting);
                 }
-                Err(ConnectError::Unaddressable) => {
-                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
-                }
-                Err(ConnectError::InvalidState) => {
-                    // Distinguish timeout from RST using elapsed time
-                    match socket_handle.tcp().connect_initiated_at_us {
-                        Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
-                            proxy.set_async_error(errors::SocketAsyncError::TimedOut);
-                            result = Err(ConnectError::TimedOut);
-                        }
-                        _ => proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused),
-                    }
+                Err(
+                    ConnectError::InvalidState
+                    | ConnectError::TimedOut
+                    | ConnectError::ConnectionReset
+                    | ConnectError::ConnectionAborted,
+                ) => {
+                    // The failure is reported here, so it is no longer pending, and the socket is
+                    // unconnected again.
+                    let _ = proxy.get_async_error(true);
+                    proxy.disconnect();
                 }
                 Err(_) => {}
             }
@@ -1120,7 +1211,7 @@ where
         drop(descriptor_table);
 
         self.automated_platform_interaction(PollDirection::Both);
-        result
+        ret
     }
 
     /// Get the local address and port a socket is bound to.
@@ -1424,7 +1515,7 @@ where
                         local_port,
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
-                        connect_initiated_at_us: None,
+                        connection_status: ConnectionStatus::Connected,
                     }),
                     proxy: None,
                 };
@@ -1446,10 +1537,10 @@ where
     ///
     /// Data received before the read side is shut down can still be read; data written before
     /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
-    /// read side of a listening socket stops listening (pending connections are reset), and
-    /// shutting down a TCP socket that is still connecting aborts the connection attempt and
-    /// reports `ConnectionReset`.
-    /// An unconnected UDP socket is shut down too, even though `NotConnected` is returned.
+    /// read side of a listening socket stops listening (pending connections are reset) and leaves
+    /// the socket unconnected, and shutting down a TCP socket that is still connecting aborts the
+    /// connection attempt, reports `ConnectionReset`, and leaves the socket unconnected.
+    /// An unconnected socket is shut down too, even though `NotConnected` is returned.
     pub fn shutdown(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1475,20 +1566,23 @@ where
                     }
                     server_socket.backlog = None;
                     proxy.set_readable(false);
-                    proxy.set_state(socket_channel::SocketState::Closed);
+                    proxy.set_state(socket_channel::SocketState::Initial);
                 }
             }
-            ProtocolSpecific::Tcp(_) => {
+            ProtocolSpecific::Tcp(tcp_specific) => {
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
                 match tcp_socket.state() {
                     tcp::State::SynSent => {
-                        // Close the channel here; otherwise the worker would report the aborted
-                        // attempt as a refused connection.
+                        // The socket is unconnected again, so the worker does not report the
+                        // aborted attempt as a refused connection.
                         tcp_socket.abort();
+                        tcp_specific.connection_status = ConnectionStatus::Unconnected;
                         proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                        proxy.set_state(socket_channel::SocketState::Closed);
+                        proxy.set_state(socket_channel::SocketState::Initial);
                     }
                     tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {
+                        // As for UDP, shut down even an unconnected socket.
+                        proxy.shutdown(how);
                         return Err(ShutdownError::NotConnected);
                     }
                     _ => proxy.shutdown(how),
@@ -1615,6 +1709,14 @@ where
         }
 
         let ret = match socket_handle.protocol() {
+            // An unconnected socket has no connection to receive from, even if smoltcp still
+            // holds data of a failed one.
+            Protocol::Tcp
+                if socket_handle.specific.tcp().connection_status
+                    == ConnectionStatus::Unconnected =>
+            {
+                Err(ReceiveError::SocketInInvalidState)
+            }
             Protocol::Tcp => {
                 if let Some(source_addr) = source_addr {
                     // TCP is connection-oriented, so no need to provide a source address

@@ -47,10 +47,19 @@ pub enum ConnectError {
     Unaddressable,
     #[error("Connection is still in progress")]
     InProgress,
+    #[error("An earlier connection attempt is still in progress")]
+    AlreadyInProgress,
+    #[error("Socket is already connected")]
+    AlreadyConnected,
     #[error("Socket is in an invalid state")]
     InvalidState,
     #[error("Connection timed out")]
     TimedOut,
+    #[error("Connection reset by peer")]
+    ConnectionReset,
+    /// The connection attempt failed, but another operation has already reported its error.
+    #[error("Connection aborted")]
+    ConnectionAborted,
 }
 
 /// Possible errors from [`Network::get_local_addr`]

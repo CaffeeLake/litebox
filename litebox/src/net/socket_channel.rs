@@ -285,6 +285,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => unimplemented!(),
         }
     }
+
+    /// Discard what is left of a failed connection, leaving the socket unconnected; see
+    /// [`StreamSocketChannel::disconnect`].
+    pub(super) fn disconnect(&self) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.disconnect(),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => unreachable!(),
+        }
+    }
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkProxy<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
@@ -547,6 +556,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             self.inner.pollee.notify_observers(self.check_io_events());
         }
     }
+
+    /// Discard what is left of a failed connection: data not yet read or sent, and the shutdown
+    /// of either side, leaving the socket unconnected so that it can connect again.
+    pub(super) fn disconnect(&self) {
+        self.set_state(SocketState::Initial);
+        let n = self.inner.rx_cons.lock().clear();
+        self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        // Clear under the TX lock, after the state change, so that a concurrent `try_write`
+        // either queues its data before it is discarded, or finds the socket unconnected.
+        let _tx_prod = self.inner.tx_prod.lock();
+        let n = self.inner.tx_cons.lock().clear();
+        self.inner.tx_available.fetch_add(n, Ordering::Release);
+        self.inner.read_shutdown.store(false, Ordering::Release);
+        self.inner.write_shutdown.store(false, Ordering::Release);
+        self.inner.peer_closed.store(false, Ordering::Release);
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
@@ -586,8 +611,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         }
 
         match self.inner.state() {
-            SocketState::Initial | SocketState::Closed => events |= Events::HUP | Events::OUT,
-            SocketState::Error => events |= Events::ERR | Events::OUT,
+            SocketState::Initial => events |= Events::HUP | Events::OUT,
+            // A closed or failed connection can neither receive nor send.
+            SocketState::Closed | SocketState::Error => {
+                events |= Events::IN | Events::OUT | Events::HUP | Events::RDHUP;
+            }
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
             _ => {}
         }
@@ -754,7 +782,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     ///
     /// State transitions trigger appropriate event notifications:
     /// - `Connected` -> `Events::OUT` (socket is now writable)
-    /// - `Closed` -> `Events::HUP` (hang up)
+    /// - `Initial` or `Closed` -> `Events::HUP` (hang up)
     /// - `Error` -> `Events::ERR` (error condition)
     pub(super) fn set_state(&self, state: SocketState) {
         let old_state = self.inner.state();
@@ -768,7 +796,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             SocketState::Connected => {
                 self.inner.pollee.notify_observers(Events::OUT);
             }
-            SocketState::Closed => {
+            SocketState::Initial | SocketState::Closed => {
                 self.inner.pollee.notify_observers(Events::HUP);
             }
             SocketState::Error => {
